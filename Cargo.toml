@@ -1,6 +1,6 @@
 [package]
 name = "socketbridge"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 description = "A bridge application for AF_UNIX and TCP sockets."
@@ -9,3 +9,4 @@ license = "MIT"
 repository = "https://github.com/michael72/socketbridge"
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }

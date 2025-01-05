@@ -14,3 +14,5 @@ Usage:
 unix <UNIX_SOCKET_PATH> <TCP_ADDRESS>
 tcp <TCP_PORT> <UNIX_SOCKET_PATH>
 ```
+
+A sample setup involving an application running inside a docker container that communicates via the bridge to the other application on the host computer is available in the examples directory.

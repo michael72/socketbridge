@@ -1,0 +1,8 @@
+[package]
+name = "socketbridge_examples"
+version = "1.0.0"
+edition = "2021"
+
+description = "A small sample application for socketbridge."
+authors = ["Michael Schulte"]
+license = "MIT"

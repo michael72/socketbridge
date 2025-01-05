@@ -1,59 +1,72 @@
-use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::thread;
+use clap::{Arg, Command};
+use std::net::ToSocketAddrs;
 
-// Function to transfer data from a reader to a writer in a separate thread.
-// Reads data from the reader and writes it to the writer until EOF or an error occurs.
-fn transfer_data<R, W>(mut reader: R, mut writer: W)
+// Function to transfer data from a client channel to a server channel.
+// The expected underlying protocol is that the client will send data to the server
+// and the server will exactly respond once to the client until the client disconnects.
+fn bridge_client_server<C1, C2>(client: &mut C1, server: &mut C2) -> Result<(), std::io::Error>
 where
-    R: Read + Send + 'static,
-    W: Write + Send + 'static,
+    C1: Read + Write,
+    C2: Read + Write,
 {
-    thread::spawn(move || {
-        let mut buffer = [0; 4096];
-        while let Ok(bytes_read) = reader.read(&mut buffer) {
-            if bytes_read == 0 {
-                break; // EOF reached
-            }
-            if let Err(e) = writer.write_all(&buffer[..bytes_read]) {
-                eprintln!("Error writing to stream: {}", e);
-                break;
-            }
-        }
-    })
-    .join()
-    .unwrap();
+    let mut buffer = [0; 4096];
+
+    // Read request from the client
+    let bytes_read = client.read(&mut buffer)?;
+    if bytes_read == 0 {
+        // EOF or client closed connection
+        return Ok(());
+    }
+
+    // Forward request to the server
+    server.write_all(&buffer[..bytes_read])?;
+    server.flush()?;
+    
+    // Read response from the server
+    let bytes_read = server.read(&mut buffer)?;
+    if bytes_read == 0 {
+        // EOF or server closed connection
+        return Ok(());
+    }
+
+    // Send response back to the client
+    client.write_all(&buffer[..bytes_read])?;
+    client.flush()?;
+
+    Ok(())
 }
+
 
 // Handles communication from a UNIX stream to a TCP stream.
 // Sets up bidirectional forwarding between the two streams.
-fn handle_unix_to_tcp(unix_stream: UnixStream, tcp_address: String) {
-    let tcp_stream = TcpStream::connect(&tcp_address).expect("Failed to connect to TCP server");
-    let unix_stream_read = unix_stream.try_clone().expect("Failed to clone UNIX stream");
-    let unix_stream_write = unix_stream;
-    let tcp_stream_read = tcp_stream.try_clone().expect("Failed to clone TCP stream");
-    let tcp_stream_write = tcp_stream;
+fn handle_unix_to_tcp(mut unix_stream: UnixStream, tcp_address: String) {
+    let mut tcp_stream = TcpStream::connect(&tcp_address).expect("Failed to connect to TCP server");
 
-    // Forward data between UNIX stream and TCP stream.
-    transfer_data(unix_stream_read, tcp_stream_write);
-    transfer_data(tcp_stream_read, unix_stream_write);
+    loop {
+        if let Err(e) = bridge_client_server(&mut unix_stream, &mut tcp_stream) {
+            eprintln!("Error in client-server communication: {}", e);
+            break;
+        }
+    }
 }
+
 
 // Handles communication from a TCP stream to a UNIX stream.
 // Sets up bidirectional forwarding between the two streams.
-fn handle_tcp_to_unix(tcp_stream: TcpStream, unix_path: String) {
-    let unix_stream = UnixStream::connect(&unix_path).expect("Failed to connect to UNIX socket");
-    let tcp_stream_read = tcp_stream.try_clone().expect("Failed to clone TCP stream");
-    let tcp_stream_write = tcp_stream;
-    let unix_stream_read = unix_stream.try_clone().expect("Failed to clone UNIX stream");
-    let unix_stream_write = unix_stream;
+fn handle_tcp_to_unix(mut tcp_stream: TcpStream, unix_path: String) {
+    let mut unix_stream = UnixStream::connect(&unix_path).expect("Failed to connect to UNIX socket");
 
-    // Forward data between TCP stream and UNIX stream.
-    transfer_data(tcp_stream_read, unix_stream_write);
-    transfer_data(unix_stream_read, tcp_stream_write);
+    loop {
+        if let Err(e) = bridge_client_server(&mut tcp_stream, &mut unix_stream) {
+            eprintln!("Error in client-server communication: {}", e);
+            break;
+        }
+    }
 }
 
 // Runs the application in UNIX mode, setting up a UNIX socket server and forwarding connections to a TCP address.
@@ -70,6 +83,7 @@ fn run_unix_mode(unix_path: String, tcp_address: String) {
     for stream in listener.incoming() {
         match stream {
             Ok(unix_stream) => {
+                println!("bridge: unix client connected");
                 let tcp_address = tcp_address.clone();
                 thread::spawn(move || {
                     handle_unix_to_tcp(unix_stream, tcp_address);
@@ -83,13 +97,14 @@ fn run_unix_mode(unix_path: String, tcp_address: String) {
 }
 
 // Runs the application in TCP mode, setting up a TCP server and forwarding connections to a UNIX socket.
-fn run_tcp_mode(tcp_port: String, unix_path: String) {
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", tcp_port)).expect("Failed to bind to TCP port");
-    println!("TCP server listening on port {}", tcp_port);
+fn run_tcp_mode(tcp_address: String, unix_path: String) {
+    let listener = TcpListener::bind(tcp_address.clone()).expect("Failed to bind to TCP port");
+    println!("TCP server listening on port {}", tcp_address);
 
     for stream in listener.incoming() {
         match stream {
             Ok(tcp_stream) => {
+                println!("bridge: tcp client connected");
                 let unix_path = unix_path.clone();
                 thread::spawn(move || {
                     handle_tcp_to_unix(tcp_stream, unix_path);
@@ -102,34 +117,71 @@ fn run_tcp_mode(tcp_port: String, unix_path: String) {
     }
 }
 
+
+
 // Main entry point of the application.
 // The application bridges UNIX and TCP sockets based on the specified mode ('unix' or 'tcp').
 // Usage:
 //   unix <UNIX_SOCKET_PATH> <TCP_ADDRESS> - Creates a UNIX socket and forwards data to a TCP address.
 //   tcp <TCP_ADDRESS> <UNIX_SOCKET_PATH> - Creates a TCP server and forwards data to a UNIX socket.
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let matches = Command::new("socketbridge")
+        .about("Bridges UNIX and TCP sockets")
+        .arg_required_else_help(true)
+        .subcommand(
+            Command::new("unix")
+                .about("Create a UNIX socket server and forward to a TCP address")
+                .arg(
+                    Arg::new("unix_path")
+                        .help("Path to the UNIX socket")
+                        .num_args(1)
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("tcp_address")
+                        .help("TCP address to forward to (e.g., 127.0.0.1:1234)")
+                        .num_args(1)
+                        .required(true)
+                        .value_parser(validate_tcp_address),
+                ),
+        )
+        .subcommand(
+            Command::new("tcp")
+                .about("Create a TCP server and forward to a UNIX socket")
+                .arg(
+                    Arg::new("tcp_address")
+                        .help("TCP address to bind to (e.g., 0.0.0.0:1234)")
+                        .num_args(1)
+                        .required(true)
+                        .value_parser(validate_tcp_address),
+                )
+                .arg(
+                    Arg::new("unix_path")
+                        .help("Path to the UNIX socket")
+                        .num_args(1)
+                        .required(true),
+                ),
+        )
+        .get_matches();
 
-    if args.len() < 4 {
-        eprintln!("Usage:");
-        eprintln!("  unix <UNIX_SOCKET_PATH> <TCP_ADDRESS>");
-        eprintln!("  tcp <TCP_ADDRESS> <UNIX_SOCKET_PATH>");
-        return;
-    }
-
-    match args[1].as_str() {
-        "unix" => {
-            let unix_path = args[2].clone();
-            let tcp_address = args[3].clone();
+    match matches.subcommand() {
+        Some(("unix", sub_m)) => {
+            let unix_path = sub_m.get_one::<String>("unix_path").unwrap().clone();
+            let tcp_address = sub_m.get_one::<String>("tcp_address").unwrap().clone();
             run_unix_mode(unix_path, tcp_address);
         }
-        "tcp" => {
-            let tcp_port = args[2].clone();
-            let unix_path = args[3].clone();
-            run_tcp_mode(tcp_port, unix_path);
+        Some(("tcp", sub_m)) => {
+            let tcp_address = sub_m.get_one::<String>("tcp_address").unwrap().clone();
+            let unix_path = sub_m.get_one::<String>("unix_path").unwrap().clone();
+            run_tcp_mode(tcp_address, unix_path);
         }
-        _ => {
-            eprintln!("Invalid mode. Use 'unix' or 'tcp'.");
-        }
+        _ => eprintln!("Invalid command"),
     }
+}
+
+fn validate_tcp_address(addr: &str) -> Result<String, String> {
+    // Parse the address and ensure it's valid
+    addr.to_socket_addrs()
+        .map(|_| addr.to_string()) 
+        .map_err(|_| format!("Invalid TCP address: {}", addr))
 }
