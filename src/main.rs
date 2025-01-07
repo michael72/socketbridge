@@ -1,15 +1,27 @@
+use clap::{Arg, Command};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::net::ToSocketAddrs;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::thread;
-use clap::{Arg, Command};
-use std::net::ToSocketAddrs;
+
+#[derive(Debug)]
+enum BridgeError {
+    IoError(io::Error),
+    Eof, // Custom error for EOF
+}
+
+impl From<io::Error> for BridgeError {
+    fn from(err: io::Error) -> Self {
+        BridgeError::IoError(err)
+    }
+}
 
 // Function to transfer data from a client channel to a server channel.
 // The expected underlying protocol is that the client will send data to the server
 // and the server will exactly respond once to the client until the client disconnects.
-fn bridge_client_server<C1, C2>(client: &mut C1, server: &mut C2) -> Result<(), std::io::Error>
+fn bridge_client_server<C1, C2>(client: &mut C1, server: &mut C2) -> Result<(), BridgeError>
 where
     C1: Read + Write,
     C2: Read + Write,
@@ -20,18 +32,18 @@ where
     let bytes_read = client.read(&mut buffer)?;
     if bytes_read == 0 {
         // EOF or client closed connection
-        return Ok(());
+        return Err(BridgeError::Eof);
     }
 
     // Forward request to the server
     server.write_all(&buffer[..bytes_read])?;
     server.flush()?;
-    
+
     // Read response from the server
     let bytes_read = server.read(&mut buffer)?;
     if bytes_read == 0 {
         // EOF or server closed connection
-        return Ok(());
+        return Err(BridgeError::Eof);
     }
 
     // Send response back to the client
@@ -41,30 +53,47 @@ where
     Ok(())
 }
 
-
 // Handles communication from a UNIX stream to a TCP stream.
-// Sets up bidirectional forwarding between the two streams.
+// Sets up unidirectional forwarding from client to server and back.
 fn handle_unix_to_tcp(mut unix_stream: UnixStream, tcp_address: String) {
     let mut tcp_stream = TcpStream::connect(&tcp_address).expect("Failed to connect to TCP server");
 
     loop {
-        if let Err(e) = bridge_client_server(&mut unix_stream, &mut tcp_stream) {
-            eprintln!("Error in client-server communication: {}", e);
-            break;
+        match bridge_client_server(&mut unix_stream, &mut tcp_stream) {
+            Ok(_) => {} // Continue the loop on successful communication
+            Err(BridgeError::Eof) => {
+                // Break on EOF without logging an error
+                println!("Connection closed by client or server.");
+                break;
+            }
+            Err(BridgeError::IoError(e)) => {
+                // Log other I/O errors and break
+                eprintln!("Error in client-server communication: {}", e);
+                break;
+            }
         }
     }
 }
 
-
 // Handles communication from a TCP stream to a UNIX stream.
 // Sets up bidirectional forwarding between the two streams.
 fn handle_tcp_to_unix(mut tcp_stream: TcpStream, unix_path: String) {
-    let mut unix_stream = UnixStream::connect(&unix_path).expect("Failed to connect to UNIX socket");
+    let mut unix_stream =
+        UnixStream::connect(&unix_path).expect("Failed to connect to UNIX socket");
 
     loop {
-        if let Err(e) = bridge_client_server(&mut tcp_stream, &mut unix_stream) {
-            eprintln!("Error in client-server communication: {}", e);
-            break;
+        match bridge_client_server(&mut tcp_stream, &mut unix_stream) {
+            Ok(_) => {} // Continue the loop on successful communication
+            Err(BridgeError::Eof) => {
+                // Break on EOF without logging an error
+                println!("Connection closed by client or server.");
+                break;
+            }
+            Err(BridgeError::IoError(e)) => {
+                // Log other I/O errors and break
+                eprintln!("Error in client-server communication: {}", e);
+                break;
+            }
         }
     }
 }
@@ -116,8 +145,6 @@ fn run_tcp_mode(tcp_address: String, unix_path: String) {
         }
     }
 }
-
-
 
 // Main entry point of the application.
 // The application bridges UNIX and TCP sockets based on the specified mode ('unix' or 'tcp').
@@ -182,6 +209,6 @@ fn main() {
 fn validate_tcp_address(addr: &str) -> Result<String, String> {
     // Parse the address and ensure it's valid
     addr.to_socket_addrs()
-        .map(|_| addr.to_string()) 
+        .map(|_| addr.to_string())
         .map_err(|_| format!("Invalid TCP address: {}", addr))
 }
