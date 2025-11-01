@@ -18,26 +18,25 @@ impl From<io::Error> for BridgeError {
     }
 }
 
-// Function to transfer data from a client channel to a server channel.
-// The expected underlying protocol is that the client will send data to the server
-// and the server will exactly respond once to the client until the client disconnects.
-fn bridge_client_server<C1, C2>(
-    client: &mut C1,
-    server: &mut C2,
+// Forward data from source to destination stream.
+// Reads data until the buffer is not completely filled or EOF is reached.
+// Returns an error if EOF occurs before any data is read.
+fn forward_data<R, W>(
+    source: &mut R,
+    destination: &mut W,
+    buffer: &mut [u8],
     buffer_size: usize,
 ) -> Result<(), BridgeError>
 where
-    C1: Read + Write,
-    C2: Read + Write,
+    R: Read,
+    W: Write,
 {
-    let mut buffer = vec![0; buffer_size];
     let mut data_available = false;
 
-    // Read request from the client (loop if buffer is filled completely)
     loop {
-        let bytes_read = client.read(&mut buffer)?;
+        let bytes_read = source.read(buffer)?;
         if bytes_read == 0 {
-            // EOF or client closed connection - only return error if no data was read
+            // EOF or connection closed - only return error if no data was read
             if !data_available {
                 return Err(BridgeError::Eof);
             }
@@ -46,8 +45,8 @@ where
 
         data_available = true;
 
-        // Forward data to the server immediately
-        server.write_all(&buffer[..bytes_read])?;
+        // Forward data to the destination immediately
+        destination.write_all(&buffer[..bytes_read])?;
 
         // If we read less than buffer_size, we've read all available data
         if bytes_read < buffer_size {
@@ -55,79 +54,108 @@ where
         }
     }
 
-    server.flush()?;
+    destination.flush()?;
 
-    data_available = false;
+    Ok(())
+}
 
-    // Read response from the server (loop if buffer is filled completely)
-    loop {
-        let bytes_read = server.read(&mut buffer)?;
-        if bytes_read == 0 {
-            // EOF or server closed connection - only return error if no data was read
-            if !data_available {
-                return Err(BridgeError::Eof);
+// Function to transfer data bidirectionally between client and server.
+// Uses two threads to forward data in parallel: client->server and server->client.
+// This prevents deadlocks when data arrives in bursts or when either side buffers data.
+fn bridge_client_server<CR, CW, SR, SW>(
+    mut client_read: CR,
+    mut client_write: CW,
+    mut server_read: SR,
+    mut server_write: SW,
+    buffer_size: usize,
+) -> Result<(), BridgeError>
+where
+    CR: Read + Send + 'static,
+    CW: Write + Send + 'static,
+    SR: Read + Send + 'static,
+    SW: Write + Send + 'static,
+{
+    // Thread for client -> server direction
+    let buffer_size_c2s = buffer_size;
+    let client_to_server = thread::spawn(move || {
+        let mut buffer = vec![0; buffer_size_c2s];
+        
+        loop {
+            match forward_data(&mut client_read, &mut server_write, &mut buffer, buffer_size_c2s) {
+                Ok(_) => {},
+                Err(BridgeError::Eof) => {
+                    println!("Client closed connection");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Error in client->server forwarding: {:?}", e);
+                    break;
+                }
             }
-            break;
         }
+    });
 
-        data_available = true;
-
-        // Send data back to the client immediately
-        client.write_all(&buffer[..bytes_read])?;
-
-        // If we read less than buffer_size, we've read all available data
-        if bytes_read < buffer_size {
-            break;
+    // Thread for server -> client direction
+    let buffer_size_s2c = buffer_size;
+    let server_to_client = thread::spawn(move || {
+        let mut buffer = vec![0; buffer_size_s2c];
+        
+        loop {
+            match forward_data(&mut server_read, &mut client_write, &mut buffer, buffer_size_s2c) {
+                Ok(_) => {},
+                Err(BridgeError::Eof) => {
+                    println!("Server closed connection");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Error in server->client forwarding: {:?}", e);
+                    break;
+                }
+            }
         }
-    }
+    });
 
-    client.flush()?;
+    // Wait for both threads to finish
+    let _ = client_to_server.join();
+    let _ = server_to_client.join();
 
     Ok(())
 }
 
 // Handles communication from a UNIX stream to a TCP stream.
-// Sets up unidirectional forwarding from client to server and back.
-fn handle_unix_to_tcp(mut unix_stream: UnixStream, tcp_address: String, buffer_size: usize) {
-    let mut tcp_stream = TcpStream::connect(&tcp_address).expect("Failed to connect to TCP server");
+// Sets up bidirectional forwarding between client and server using parallel threads.
+fn handle_unix_to_tcp(unix_stream: UnixStream, tcp_address: String, buffer_size: usize) {
+    let tcp_stream = TcpStream::connect(&tcp_address).expect("Failed to connect to TCP server");
 
-    loop {
-        match bridge_client_server(&mut unix_stream, &mut tcp_stream, buffer_size, 1) {
-            Ok(_) => {} // Continue the loop on successful communication
-            Err(BridgeError::Eof) => {
-                // Break on EOF without logging an error
-                println!("Connection closed by client or server.");
-                break;
-            }
-            Err(BridgeError::IoError(e)) => {
-                // Log other I/O errors and break
-                eprintln!("Error in client-server communication: {}", e);
-                break;
-            }
-        }
+    // Clone streams to get separate read/write handles
+    let unix_read = unix_stream.try_clone().expect("Failed to clone UNIX stream");
+    let unix_write = unix_stream;
+    let tcp_read = tcp_stream.try_clone().expect("Failed to clone TCP stream");
+    let tcp_write = tcp_stream;
+
+    match bridge_client_server(unix_read, unix_write, tcp_read, tcp_write, buffer_size) {
+        Ok(_) => println!("Connection closed normally."),
+        Err(BridgeError::Eof) => println!("Connection closed by client or server."),
+        Err(BridgeError::IoError(e)) => eprintln!("Error in client-server communication: {}", e),
     }
 }
 
 // Handles communication from a TCP stream to a UNIX stream.
-// Sets up bidirectional forwarding between the two streams.
-fn handle_tcp_to_unix(mut tcp_stream: TcpStream, unix_path: String, buffer_size: usize) {
-    let mut unix_stream =
+// Sets up bidirectional forwarding between client and server using parallel threads.
+fn handle_tcp_to_unix(tcp_stream: TcpStream, unix_path: String, buffer_size: usize) {
+    let unix_stream =
         UnixStream::connect(&unix_path).expect("Failed to connect to UNIX socket");
 
-    loop {
-        match bridge_client_server(&mut tcp_stream, &mut unix_stream, buffer_size, 2) {
-            Ok(_) => {} // Continue the loop on successful communication
-            Err(BridgeError::Eof) => {
-                // Break on EOF without logging an error
-                println!("Connection closed by client or server.");
-                break;
-            }
-            Err(BridgeError::IoError(e)) => {
-                // Log other I/O errors and break
-                eprintln!("Error in client-server communication: {}", e);
-                break;
-            }
-        }
+    // Clone streams to get separate read/write handles
+    let tcp_read = tcp_stream.try_clone().expect("Failed to clone TCP stream");
+    let tcp_write = tcp_stream;
+    let unix_read = unix_stream.try_clone().expect("Failed to clone UNIX stream");
+    let unix_write = unix_stream;
+
+    match bridge_client_server(tcp_read, tcp_write, unix_read, unix_write, buffer_size) {
+        Ok(_) => println!("Connection closed normally."),
+        Err(BridgeError::Eof) => println!("Connection closed by client or server."),
+        Err(BridgeError::IoError(e)) => eprintln!("Error in client-server communication: {}", e),
     }
 }
 
